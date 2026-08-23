@@ -42,6 +42,7 @@ import contextlib
 import hashlib
 import hmac
 import json
+import logging
 import os
 import uuid
 from contextlib import asynccontextmanager
@@ -73,6 +74,9 @@ INFERENCE_PREFIX = "/inference/v1"
 API_KEY = os.environ.get("BOB_API_KEY", "")
 INSTANCE_ID = os.environ.get("BOB_INSTANCE_ID", "")
 TEAM_ID = os.environ.get("BOB_TEAM_ID", "")
+
+logging.basicConfig(level=logging.INFO, format="%(message)s")
+logger = logging.getLogger("bob-proxy")
 
 
 @asynccontextmanager
@@ -249,7 +253,7 @@ def _anthropic_request_to_openai(body: dict) -> dict:
     original_model = body.get("model", "")
     out["model"] = MODEL_MAP.get(original_model, DEFAULT_MODEL)
     if out["model"] != original_model:
-        print(f"[anthropic->openai] Model rewrite: {original_model} -> {out['model']}")
+        logger.info("[anthropic->openai] Model rewrite: %s -> %s", original_model, out["model"])
     out["messages"] = _translate_messages(body.get("messages", []), body.get("system"))
     tools = _translate_tools(body.get("tools"))
     if tools:
@@ -532,18 +536,14 @@ async def anthropic_messages(request: Request):
     openai_body = _anthropic_request_to_openai(anthropic_body)
     openai_json = json.dumps(openai_body)
 
-    print(
-        f"[anthropic->openai] model={original_model}, stream={is_stream}, "
-        f"messages={len(anthropic_body.get('messages', []))}, tools={len(anthropic_body.get('tools', []))}, "
-        f"tool_choice={anthropic_body.get('tool_choice')!r}"
+    logger.info(
+        "[anthropic->openai] model=%s, stream=%s, messages=%s, tools=%s, tool_choice=%r",
+        original_model,
+        is_stream,
+        len(anthropic_body.get("messages", [])),
+        len(anthropic_body.get("tools", [])),
+        anthropic_body.get("tool_choice"),
     )
-    if anthropic_body.get("tools"):
-        print(
-            "[anthropic->openai] tool_names="
-            f"{[tool.get('name') for tool in anthropic_body.get('tools', []) if isinstance(tool, dict)]}"
-        )
-    if anthropic_body.get("tool_choice") is not None:
-        print(f"[anthropic->openai] translated_tool_choice={openai_body.get('tool_choice')!r}")
 
     target_path = f"{INFERENCE_PREFIX}/chat/completions"
     headers = _backend_headers("POST", target_path, openai_json)
@@ -556,10 +556,10 @@ async def anthropic_messages(request: Request):
             content=openai_json,
         )
         backend_resp = get_client().send(resp, stream=True)
-        print(f"[anthropic->openai] POST {target_path} -> {backend_resp.status_code}")
+        logger.info("[anthropic->openai] POST %s -> %s", target_path, backend_resp.status_code)
         if backend_resp.status_code >= 400:
             error_text = backend_resp.text[:1000]
-            print(f"[anthropic->openai] Error: {error_text}")
+            logger.error("[anthropic->openai] Error: %s", error_text)
             backend_resp.close()
             return JSONResponse(
                 {"type": "error", "error": {"type": "api_error", "message": error_text}},
@@ -575,11 +575,11 @@ async def anthropic_messages(request: Request):
         headers=headers,
         content=openai_json,
     )
-    print(f"[anthropic->openai] POST {target_path} -> {resp.status_code}")
+    logger.info("[anthropic->openai] POST %s -> %s", target_path, resp.status_code)
 
     if resp.status_code >= 400:
         error_text = resp.text[:1000]
-        print(f"[anthropic->openai] Error: {error_text}")
+        logger.error("[anthropic->openai] Error: %s", error_text)
         return JSONResponse(
             {"type": "error", "error": {"type": "api_error", "message": error_text}},
             status_code=resp.status_code,
@@ -618,7 +618,7 @@ async def bedrock_invoke(model_id: str, request: Request):
     body.pop("anthropic_version", None)
     openai_json = json.dumps(_anthropic_request_to_openai(body))
 
-    print(f"[bedrock] invoke: model={original_model}, messages={len(body.get('messages', []))}")
+    logger.info("[bedrock] invoke: model=%s, messages=%s", original_model, len(body.get("messages", [])))
     target_path = f"{INFERENCE_PREFIX}/chat/completions"
     headers = _backend_headers("POST", target_path, openai_json)
 
@@ -641,7 +641,7 @@ async def bedrock_invoke(model_id: str, request: Request):
             status_code=504,
         )
 
-    print(f"[bedrock] POST {target_path} -> {resp.status_code}")
+    logger.info("[bedrock] POST %s -> %s", target_path, resp.status_code)
     if resp.status_code >= 400:
         return JSONResponse(
             {
@@ -681,7 +681,7 @@ async def bedrock_invoke_stream(model_id: str, request: Request):
     body["stream"] = True
     openai_json = json.dumps(_anthropic_request_to_openai(body))
 
-    print(f"[bedrock] invoke-stream: model={original_model}, messages={len(body.get('messages', []))}")
+    logger.info("[bedrock] invoke-stream: model=%s, messages=%s", original_model, len(body.get("messages", [])))
     target_path = f"{INFERENCE_PREFIX}/chat/completions"
     headers = _backend_headers("POST", target_path, openai_json)
 
@@ -692,7 +692,7 @@ async def bedrock_invoke_stream(model_id: str, request: Request):
         content=openai_json,
     )
     resp = get_client().send(req, stream=True)
-    print(f"[bedrock] stream POST {target_path} -> {resp.status_code}")
+    logger.info("[bedrock] stream POST %s -> %s", target_path, resp.status_code)
     if resp.status_code >= 400:
         error_text = resp.text[:1000]
         resp.close()
@@ -744,14 +744,9 @@ async def proxy(path: str, request: Request):
                 original_model = payload["model"]
                 payload["model"] = MODEL_MAP.get(original_model, DEFAULT_MODEL)
                 if payload["model"] != original_model:
-                    print(f"[proxy] Model rewrite: {original_model} -> {payload['model']}")
+                    logger.info("[proxy] Model rewrite: %s -> %s", original_model, payload["model"])
                 if "temperature" in payload and "top_p" in payload:
                     del payload["top_p"]
-                print(
-                    f"[proxy] payload model={original_model!r}, stream={payload.get('stream', False)}, "
-                    f"tools={len(payload.get('tools', [])) if isinstance(payload.get('tools'), list) else 0}, "
-                    f"tool_choice={payload.get('tool_choice')!r}"
-                )
                 body = json.dumps(payload)
         except (json.JSONDecodeError, KeyError):
             pass
@@ -764,20 +759,13 @@ async def proxy(path: str, request: Request):
     headers = _backend_headers(request.method, signed_path, body)
     if request.headers.get("content-type"):
         headers["Content-Type"] = request.headers["content-type"]
-    if target_path.endswith("/chat/completions"):
-        print(
-            f"[proxy] request accept={request.headers.get('accept')!r}, "
-            f"content_type={request.headers.get('content-type')!r}, "
-            f"content_length={request.headers.get('content-length')!r}, "
-            f"transfer_encoding={request.headers.get('transfer-encoding')!r}"
-        )
     if target_path.endswith("/chat/completions") and not body_bytes:
         if request.method == "POST":
             accept = request.headers.get("accept", "")
             if "text/event-stream" in accept:
-                print("[proxy] Empty SSE probe detected")
+                logger.info("[proxy] Empty SSE probe detected")
                 return StreamingResponse(iter([b"event: done\ndata: [DONE]\n\n"]), media_type="text/event-stream")
-        print("[proxy] Empty chat request body received")
+        logger.warning("[proxy] Empty chat request body received")
         return JSONResponse(
             {
                 "error": {
@@ -796,9 +784,7 @@ async def proxy(path: str, request: Request):
             content=body,
         )
         resp = get_client().send(req, stream=True)
-        print(f"[proxy] {request.method} {signed_path} -> {resp.status_code}")
-        if resp.status_code >= 400:
-            print(f"[proxy] Stream error content-type={resp.headers.get('content-type')!r}")
+        logger.info("[proxy] %s %s -> %s", request.method, signed_path, resp.status_code)
         return StreamingResponse(
             resp.iter_bytes(),
             status_code=resp.status_code,
@@ -811,9 +797,9 @@ async def proxy(path: str, request: Request):
         headers=headers,
         content=body,
     )
-    print(f"[proxy] {request.method} {signed_path} -> {resp.status_code}")
+    logger.info("[proxy] %s %s -> %s", request.method, signed_path, resp.status_code)
     if resp.status_code >= 400:
-        print(f"[proxy] Error body: {resp.text[:1000]}")
+        logger.error("[proxy] Error body: %s", resp.text[:1000])
 
     return StreamingResponse(
         iter([resp.content]),
@@ -841,12 +827,12 @@ def _discover_instance_and_team() -> None:
             timeout=10,
         )
         if r.status_code != 200:
-            print(f"[startup] /admin/v1/profile -> {r.status_code}: {r.text[:200]}")
+            logger.warning("[startup] /admin/v1/profile -> %s: %s", r.status_code, r.text[:200])
             return
         data = r.json()
         instances = data.get("instances", [])
         if not instances:
-            print("[startup] No instances on profile; cannot auto-discover team.")
+            logger.warning("[startup] No instances on profile; cannot auto-discover team.")
             return
         inst = instances[0]
         if not INSTANCE_ID:
@@ -855,42 +841,45 @@ def _discover_instance_and_team() -> None:
         if not TEAM_ID and teams:
             TEAM_ID = teams[0].get("id", "")
     except Exception as e:
-        print(f"[startup] Failed to auto-discover instance/team: {e}")
+        logger.warning("[startup] Failed to auto-discover instance/team: %s", e)
 
 
 if not API_KEY:
-    print("ERROR: No API key configured. Set BOB_API_KEY in .env or environment.")
+    logger.error("No API key configured. Set BOB_API_KEY in .env or environment.")
     raise SystemExit(1)
 
 _discover_instance_and_team()
 
 
 def _print_banner():
-    print("=== bob-proxy ===\n")
-    print(f"  API key:  {API_KEY[:10]}...{API_KEY[-4:]}")
-    print(f"  Instance: {INSTANCE_ID or '(not set)'}")
-    print(f"  Team:     {TEAM_ID or '(not set)'}")
-    print(f"  Backend:  {BASE_URL}")
-    print(f"  Proxy:    http://localhost:{PORT}\n")
-    print("OpenCode / OpenAI-compatible:")
-    print(f"  baseURL: http://localhost:{PORT}/v1")
-    print("  apiKey:  any-value\n")
-    print("JetBrains AI Assistant:")
-    print(f"  URL: http://localhost:{PORT}/v1  |  Model: sonnet-4.5\n")
-    print("Claude Code (Anthropic mode):")
-    print(f"  ANTHROPIC_BASE_URL=http://localhost:{PORT}/anthropic ANTHROPIC_API_KEY=proxy claude\n")
-    print("Claude Code (Bedrock mode — Windows, set once):")
-    print('  [System.Environment]::SetEnvironmentVariable("CLAUDE_CODE_USE_BEDROCK","1","User")')
-    print(
-        f'  [System.Environment]::SetEnvironmentVariable("ANTHROPIC_BEDROCK_BASE_URL","http://localhost:{PORT}/bedrock","User")'
+    logger.info("=== bob-proxy ===\n")
+    logger.info("  API key:  %s...%s", API_KEY[:10], API_KEY[-4:])
+    logger.info("  Instance: %s", INSTANCE_ID or "(not set)")
+    logger.info("  Team:     %s", TEAM_ID or "(not set)")
+    logger.info("  Backend:  %s", BASE_URL)
+    logger.info("  Proxy:    http://localhost:%s\n", PORT)
+    logger.info("OpenCode / OpenAI-compatible:")
+    logger.info("  baseURL: http://localhost:%s/v1", PORT)
+    logger.info("  apiKey:  any-value\n")
+    logger.info("JetBrains AI Assistant:")
+    logger.info("  URL: http://localhost:%s/v1  |  Model: sonnet-4.5\n", PORT)
+    logger.info("Claude Code (Anthropic mode):")
+    logger.info("  ANTHROPIC_BASE_URL=http://localhost:%s/anthropic ANTHROPIC_API_KEY=proxy claude\n", PORT)
+    logger.info("Claude Code (Bedrock mode — Windows, set once):")
+    logger.info('  [System.Environment]::SetEnvironmentVariable("CLAUDE_CODE_USE_BEDROCK","1","User")')
+    logger.info(
+        '  [System.Environment]::SetEnvironmentVariable("ANTHROPIC_BEDROCK_BASE_URL","http://localhost:%s/bedrock","User")',
+        PORT,
     )
-    print('  [System.Environment]::SetEnvironmentVariable("CLAUDE_CODE_SKIP_BEDROCK_AUTH","1","User")')
-    print('  [System.Environment]::SetEnvironmentVariable("CLAUDE_CODE_DISABLE_BEDROCK_CONTENT_TYPE_GUARD","1","User")')
-    print('  [System.Environment]::SetEnvironmentVariable("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC","1","User")')
-    print('  [System.Environment]::SetEnvironmentVariable("AWS_ACCESS_KEY_ID","dummy","User")')
-    print('  [System.Environment]::SetEnvironmentVariable("AWS_SECRET_ACCESS_KEY","dummy","User")')
-    print('  [System.Environment]::SetEnvironmentVariable("AWS_REGION","us-east-1","User")')
-    print('  [System.Environment]::SetEnvironmentVariable("ANTHROPIC_DEFAULT_MODEL","premium","User")\n')
+    logger.info('  [System.Environment]::SetEnvironmentVariable("CLAUDE_CODE_SKIP_BEDROCK_AUTH","1","User")')
+    logger.info(
+        '  [System.Environment]::SetEnvironmentVariable("CLAUDE_CODE_DISABLE_BEDROCK_CONTENT_TYPE_GUARD","1","User")'
+    )
+    logger.info('  [System.Environment]::SetEnvironmentVariable("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC","1","User")')
+    logger.info('  [System.Environment]::SetEnvironmentVariable("AWS_ACCESS_KEY_ID","dummy","User")')
+    logger.info('  [System.Environment]::SetEnvironmentVariable("AWS_SECRET_ACCESS_KEY","dummy","User")')
+    logger.info('  [System.Environment]::SetEnvironmentVariable("AWS_REGION","us-east-1","User")')
+    logger.info('  [System.Environment]::SetEnvironmentVariable("ANTHROPIC_DEFAULT_MODEL","premium","User")\n')
 
 
 if __name__ == "__main__":

@@ -1,0 +1,10 @@
+[project]
+name = "bob-proxy"
+version = "1.0.0"
+description = "Local HMAC-signing proxy for Bob's LiteLLM backend"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "httpx",
+    "fastapi[standard]",
+]

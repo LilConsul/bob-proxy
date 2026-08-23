@@ -1,0 +1,8 @@
+services:
+  proxy:
+    build: .
+    ports:
+      - "8989:8989"
+    env_file:
+      - .env
+    restart: unless-stopped

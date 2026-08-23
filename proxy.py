@@ -38,18 +38,19 @@ Listens on http://localhost:8989 and forwards to Bob's backend with
 HMAC signing + API key auth injected into every request.
 """
 
+import contextlib
 import hashlib
 import hmac
 import json
 import os
 import uuid
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 import httpx
 import uvicorn
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, WebSocket
 from fastapi.responses import JSONResponse, StreamingResponse
 
 # Load .env file if present
@@ -72,6 +73,7 @@ INFERENCE_PREFIX = "/inference/v1"
 API_KEY = os.environ.get("BOB_API_KEY", "")
 INSTANCE_ID = os.environ.get("BOB_INSTANCE_ID", "")
 TEAM_ID = os.environ.get("BOB_TEAM_ID", "")
+
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
@@ -114,7 +116,7 @@ DEFAULT_MODEL = "premium"
 # HMAC signing
 # ---------------------------------------------------------------------------
 def sign_request(method: str, path: str, body: str = "") -> dict[str, str]:
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     timestamp = now.strftime("%Y-%m-%dT%H:%M:%S.") + f"{now.microsecond // 1000:03d}Z"
     body_hash = hashlib.sha256(body.encode()).hexdigest()
     message = f"{method.upper()}\n{path}\n{timestamp}\n{body_hash}"
@@ -127,7 +129,7 @@ def sign_request(method: str, path: str, body: str = "") -> dict[str, str]:
 # ---------------------------------------------------------------------------
 def _sse(event_type: str, data) -> bytes:
     payload = json.dumps(data, ensure_ascii=False) if not isinstance(data, str) else data
-    return f"event: {event_type}\ndata: {payload}\n\n".encode("utf-8")
+    return f"event: {event_type}\ndata: {payload}\n\n".encode()
 
 
 def _estimate_tokens(text: str) -> int:
@@ -177,7 +179,13 @@ def _translate_messages(messages: list, system: str | list | None) -> list:
                 if isinstance(tr_content, list):
                     text_parts = [b.get("text", "") for b in tr_content if b.get("type") == "text"]
                     tr_content = "\n".join(text_parts) if text_parts else ""
-                out.append({"role": "tool", "tool_call_id": tr.get("tool_use_id", ""), "content": tr_content})
+                out.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tr.get("tool_use_id", ""),
+                        "content": tr_content,
+                    }
+                )
             other_blocks = [b for b in content if b.get("type") not in ("tool_result", "thinking")]
             if other_blocks:
                 out.append({"role": "user", "content": _translate_content_blocks(other_blocks)})
@@ -187,8 +195,14 @@ def _translate_messages(messages: list, system: str | list | None) -> list:
             text_parts = [b.get("text", "") for b in content if b.get("type") == "text"]
             text_content = "\n".join(t for t in text_parts if t) or None
             tool_calls = [
-                {"id": tu.get("id", f"call_{uuid.uuid4().hex[:24]}"), "type": "function",
-                 "function": {"name": tu["name"], "arguments": json.dumps(tu.get("input", {}))}}
+                {
+                    "id": tu.get("id", f"call_{uuid.uuid4().hex[:24]}"),
+                    "type": "function",
+                    "function": {
+                        "name": tu["name"],
+                        "arguments": json.dumps(tu.get("input", {})),
+                    },
+                }
                 for tu in tool_uses
             ]
             out.append({"role": "assistant", "content": text_content, "tool_calls": tool_calls})
@@ -200,8 +214,17 @@ def _translate_messages(messages: list, system: str | list | None) -> list:
 def _translate_tools(tools: list | None) -> list | None:
     if not tools:
         return None
-    return [{"type": "function", "function": {"name": t["name"], "description": t.get("description", ""),
-             "parameters": t.get("input_schema", {"type": "object", "properties": {}})}} for t in tools]
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": t["name"],
+                "description": t.get("description", ""),
+                "parameters": t.get("input_schema", {"type": "object", "properties": {}}),
+            },
+        }
+        for t in tools
+    ]
 
 
 def _translate_tool_choice(tc) -> str | dict | None:
@@ -214,7 +237,9 @@ def _translate_tool_choice(tc) -> str | dict | None:
         if tc_type == "any":
             return "required"
         if tc_type == "tool":
-            return {"type": "function", "function": {"name": tc["name"]}}
+            name = tc.get("name") or tc.get("function", {}).get("name")
+            if name:
+                return {"type": "function", "function": {"name": name}}
         return "auto"
     return None
 
@@ -232,8 +257,12 @@ def _anthropic_request_to_openai(body: dict) -> dict:
     tc = _translate_tool_choice(body.get("tool_choice"))
     if tc is not None:
         out["tool_choice"] = tc
-    for key, okey in [("max_tokens", "max_tokens"), ("temperature", "temperature"),
-                      ("top_p", "top_p"), ("stop_sequences", "stop")]:
+    for key, okey in [
+        ("max_tokens", "max_tokens"),
+        ("temperature", "temperature"),
+        ("top_p", "top_p"),
+        ("stop_sequences", "stop"),
+    ]:
         if key in body:
             out[okey] = body[key]
     if "temperature" in out and "top_p" in out:
@@ -256,29 +285,62 @@ def _openai_response_to_anthropic(resp_json: dict, model: str) -> dict:
             args = json.loads(fn.get("arguments", "{}"))
         except json.JSONDecodeError:
             args = {}
-        content_blocks.append({"type": "tool_use", "id": tc.get("id", f"toolu_{uuid.uuid4().hex[:24]}"),
-                                "name": fn.get("name", ""), "input": args})
+        content_blocks.append(
+            {
+                "type": "tool_use",
+                "id": tc.get("id", f"toolu_{uuid.uuid4().hex[:24]}"),
+                "name": fn.get("name", ""),
+                "input": args,
+            }
+        )
     finish = choice.get("finish_reason", "stop")
-    stop_reason = {"stop": "end_turn", "length": "max_tokens", "tool_calls": "tool_use",
-                   "content_filter": "end_turn"}.get(finish, "end_turn")
+    stop_reason = {
+        "stop": "end_turn",
+        "length": "max_tokens",
+        "tool_calls": "tool_use",
+        "content_filter": "end_turn",
+    }.get(finish, "end_turn")
     usage = resp_json.get("usage", {})
     return {
-        "id": f"msg_{uuid.uuid4().hex[:24]}", "type": "message", "role": "assistant", "model": model,
+        "id": f"msg_{uuid.uuid4().hex[:24]}",
+        "type": "message",
+        "role": "assistant",
+        "model": model,
         "content": content_blocks if content_blocks else [{"type": "text", "text": ""}],
-        "stop_reason": stop_reason, "stop_sequence": None,
-        "usage": {"input_tokens": usage.get("prompt_tokens", 0), "output_tokens": usage.get("completion_tokens", 0),
-                  "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0},
+        "stop_reason": stop_reason,
+        "stop_sequence": None,
+        "usage": {
+            "input_tokens": usage.get("prompt_tokens", 0),
+            "output_tokens": usage.get("completion_tokens", 0),
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0,
+        },
     }
 
 
 def _stream_openai_to_anthropic(resp: httpx.Response, model: str, input_tokens: int):
     msg_id = f"msg_{uuid.uuid4().hex[:24]}"
-    yield _sse("message_start", {"type": "message_start", "message": {
-        "id": msg_id, "type": "message", "role": "assistant", "model": model, "content": [],
-        "stop_reason": None, "stop_sequence": None,
-        "usage": {"input_tokens": input_tokens, "output_tokens": 0,
-                  "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0},
-    }})
+    yield _sse(
+        "message_start",
+        {
+            "type": "message_start",
+            "message": {
+                "id": msg_id,
+                "type": "message",
+                "role": "assistant",
+                "model": model,
+                "content": [],
+                "stop_reason": None,
+                "stop_sequence": None,
+                "usage": {
+                    "input_tokens": input_tokens,
+                    "output_tokens": 0,
+                    "cache_creation_input_tokens": 0,
+                    "cache_read_input_tokens": 0,
+                },
+            },
+        },
+    )
     yield _sse("ping", {"type": "ping"})
 
     block_index = 0
@@ -310,20 +372,39 @@ def _stream_openai_to_anthropic(resp: httpx.Response, model: str, input_tokens: 
         delta = choice.get("delta", {})
         finish_reason = choice.get("finish_reason")
         if finish_reason:
-            stop_reason = {"stop": "end_turn", "length": "max_tokens", "tool_calls": "tool_use"}.get(finish_reason, "end_turn")
+            stop_reason = {
+                "stop": "end_turn",
+                "length": "max_tokens",
+                "tool_calls": "tool_use",
+            }.get(finish_reason, "end_turn")
 
         text_delta = delta.get("content")
         if text_delta:
             if not current_text_open:
-                yield _sse("content_block_start", {"type": "content_block_start", "index": block_index,
-                                                    "content_block": {"type": "text", "text": ""}})
+                yield _sse(
+                    "content_block_start",
+                    {
+                        "type": "content_block_start",
+                        "index": block_index,
+                        "content_block": {"type": "text", "text": ""},
+                    },
+                )
                 current_text_open = True
-            yield _sse("content_block_delta", {"type": "content_block_delta", "index": block_index,
-                                               "delta": {"type": "text_delta", "text": text_delta}})
+            yield _sse(
+                "content_block_delta",
+                {
+                    "type": "content_block_delta",
+                    "index": block_index,
+                    "delta": {"type": "text_delta", "text": text_delta},
+                },
+            )
 
         if delta.get("tool_calls"):
             if current_text_open:
-                yield _sse("content_block_stop", {"type": "content_block_stop", "index": block_index})
+                yield _sse(
+                    "content_block_stop",
+                    {"type": "content_block_stop", "index": block_index},
+                )
                 block_index += 1
                 current_text_open = False
             for tc_delta in delta["tool_calls"]:
@@ -332,24 +413,57 @@ def _stream_openai_to_anthropic(resp: httpx.Response, model: str, input_tokens: 
                     fn = tc_delta.get("function", {})
                     tc_id = tc_delta.get("id", f"toolu_{uuid.uuid4().hex[:24]}")
                     tc_name = fn.get("name", "")
-                    tool_calls_in_progress[tc_index] = {"id": tc_id, "name": tc_name, "args": "", "block_index": block_index}
-                    yield _sse("content_block_start", {"type": "content_block_start", "index": block_index,
-                                                       "content_block": {"type": "tool_use", "id": tc_id, "name": tc_name, "input": {}}})
+                    tool_calls_in_progress[tc_index] = {
+                        "id": tc_id,
+                        "name": tc_name,
+                        "args": "",
+                        "block_index": block_index,
+                    }
+                    yield _sse(
+                        "content_block_start",
+                        {
+                            "type": "content_block_start",
+                            "index": block_index,
+                            "content_block": {
+                                "type": "tool_use",
+                                "id": tc_id,
+                                "name": tc_name,
+                                "input": {},
+                            },
+                        },
+                    )
                     block_index += 1
                 args_fragment = tc_delta.get("function", {}).get("arguments", "")
                 if args_fragment:
                     tool_calls_in_progress[tc_index]["args"] += args_fragment
-                    yield _sse("content_block_delta", {"type": "content_block_delta",
-                                                       "index": tool_calls_in_progress[tc_index]["block_index"],
-                                                       "delta": {"type": "input_json_delta", "partial_json": args_fragment}})
+                    yield _sse(
+                        "content_block_delta",
+                        {
+                            "type": "content_block_delta",
+                            "index": tool_calls_in_progress[tc_index]["block_index"],
+                            "delta": {
+                                "type": "input_json_delta",
+                                "partial_json": args_fragment,
+                            },
+                        },
+                    )
 
     if current_text_open:
         yield _sse("content_block_stop", {"type": "content_block_stop", "index": block_index})
     for tc_info in tool_calls_in_progress.values():
-        yield _sse("content_block_stop", {"type": "content_block_stop", "index": tc_info["block_index"]})
+        yield _sse(
+            "content_block_stop",
+            {"type": "content_block_stop", "index": tc_info["block_index"]},
+        )
 
-    yield _sse("message_delta", {"type": "message_delta", "delta": {"stop_reason": stop_reason, "stop_sequence": None},
-                                 "usage": {"output_tokens": output_tokens}})
+    yield _sse(
+        "message_delta",
+        {
+            "type": "message_delta",
+            "delta": {"stop_reason": stop_reason, "stop_sequence": None},
+            "usage": {"output_tokens": output_tokens},
+        },
+    )
     yield _sse("message_stop", {"type": "message_stop"})
 
 
@@ -367,7 +481,11 @@ def get_client() -> httpx.Client:
 
 
 def _backend_headers(method: str, path: str, body: str) -> dict[str, str]:
-    headers = {"Authorization": f"Apikey {API_KEY}", "Content-Type": "application/json", "User-Agent": "bobshell/1.0.4"}
+    headers = {
+        "Authorization": f"Apikey {API_KEY}",
+        "Content-Type": "application/json",
+        "User-Agent": "bobshell/1.0.4",
+    }
     if INSTANCE_ID:
         headers["x-instance-id"] = INSTANCE_ID
     if TEAM_ID:
@@ -401,34 +519,81 @@ async def anthropic_messages(request: Request):
     try:
         anthropic_body = json.loads(raw_body)
     except json.JSONDecodeError as e:
-        return JSONResponse({"type": "error", "error": {"type": "invalid_request_error", "message": str(e)}}, status_code=400)
+        return JSONResponse(
+            {
+                "type": "error",
+                "error": {"type": "invalid_request_error", "message": str(e)},
+            },
+            status_code=400,
+        )
 
     original_model = anthropic_body.get("model", "unknown")
     is_stream = anthropic_body.get("stream", False)
     openai_body = _anthropic_request_to_openai(anthropic_body)
     openai_json = json.dumps(openai_body)
 
-    print(f"[anthropic->openai] model={original_model}, stream={is_stream}, "
-          f"messages={len(anthropic_body.get('messages', []))}, tools={len(anthropic_body.get('tools', []))}")
+    print(
+        f"[anthropic->openai] model={original_model}, stream={is_stream}, "
+        f"messages={len(anthropic_body.get('messages', []))}, tools={len(anthropic_body.get('tools', []))}, "
+        f"tool_choice={anthropic_body.get('tool_choice')!r}"
+    )
+    if anthropic_body.get("tools"):
+        print(
+            "[anthropic->openai] tool_names="
+            f"{[tool.get('name') for tool in anthropic_body.get('tools', []) if isinstance(tool, dict)]}"
+        )
+    if anthropic_body.get("tool_choice") is not None:
+        print(f"[anthropic->openai] translated_tool_choice={openai_body.get('tool_choice')!r}")
 
     target_path = f"{INFERENCE_PREFIX}/chat/completions"
     headers = _backend_headers("POST", target_path, openai_json)
 
-    resp = get_client().post(f"{BASE_URL}{target_path}", headers=headers, content=openai_json, stream=is_stream)
+    if is_stream:
+        resp = get_client().build_request(
+            "POST",
+            f"{BASE_URL}{target_path}",
+            headers=headers,
+            content=openai_json,
+        )
+        backend_resp = get_client().send(resp, stream=True)
+        print(f"[anthropic->openai] POST {target_path} -> {backend_resp.status_code}")
+        if backend_resp.status_code >= 400:
+            error_text = backend_resp.text[:1000]
+            print(f"[anthropic->openai] Error: {error_text}")
+            backend_resp.close()
+            return JSONResponse(
+                {"type": "error", "error": {"type": "api_error", "message": error_text}},
+                status_code=backend_resp.status_code,
+            )
+        return StreamingResponse(
+            _stream_openai_to_anthropic(backend_resp, original_model, _estimate_tokens(openai_json)),
+            media_type="text/event-stream",
+        )
+
+    resp = get_client().post(
+        f"{BASE_URL}{target_path}",
+        headers=headers,
+        content=openai_json,
+    )
     print(f"[anthropic->openai] POST {target_path} -> {resp.status_code}")
 
     if resp.status_code >= 400:
         error_text = resp.text[:1000]
         print(f"[anthropic->openai] Error: {error_text}")
-        return JSONResponse({"type": "error", "error": {"type": "api_error", "message": error_text}}, status_code=resp.status_code)
-
-    if is_stream:
-        return StreamingResponse(_stream_openai_to_anthropic(resp, original_model, _estimate_tokens(openai_json)),
-                                 media_type="text/event-stream")
+        return JSONResponse(
+            {"type": "error", "error": {"type": "api_error", "message": error_text}},
+            status_code=resp.status_code,
+        )
     try:
         anthropic_resp = _openai_response_to_anthropic(resp.json(), original_model)
     except Exception:
-        return JSONResponse({"type": "error", "error": {"type": "api_error", "message": "Invalid JSON from backend"}}, status_code=502)
+        return JSONResponse(
+            {
+                "type": "error",
+                "error": {"type": "api_error", "message": "Invalid JSON from backend"},
+            },
+            status_code=502,
+        )
     return JSONResponse(anthropic_resp)
 
 
@@ -441,7 +606,13 @@ async def bedrock_invoke(model_id: str, request: Request):
     try:
         body = json.loads(raw_body)
     except json.JSONDecodeError as e:
-        return JSONResponse({"type": "error", "error": {"type": "invalid_request_error", "message": str(e)}}, status_code=400)
+        return JSONResponse(
+            {
+                "type": "error",
+                "error": {"type": "invalid_request_error", "message": str(e)},
+            },
+            status_code=400,
+        )
 
     original_model = body.pop("model", model_id)
     body.pop("anthropic_version", None)
@@ -452,17 +623,43 @@ async def bedrock_invoke(model_id: str, request: Request):
     headers = _backend_headers("POST", target_path, openai_json)
 
     try:
-        resp = get_client().post(f"{BASE_URL}{target_path}", headers=headers, content=openai_json, timeout=120)
+        resp = get_client().post(
+            f"{BASE_URL}{target_path}",
+            headers=headers,
+            content=openai_json,
+            timeout=120,
+        )
     except httpx.TimeoutException:
-        return JSONResponse({"type": "error", "error": {"type": "timeout_error", "message": "Request timed out after 120s"}}, status_code=504)
+        return JSONResponse(
+            {
+                "type": "error",
+                "error": {
+                    "type": "timeout_error",
+                    "message": "Request timed out after 120s",
+                },
+            },
+            status_code=504,
+        )
 
     print(f"[bedrock] POST {target_path} -> {resp.status_code}")
     if resp.status_code >= 400:
-        return JSONResponse({"type": "error", "error": {"type": "api_error", "message": resp.text[:1000]}}, status_code=resp.status_code)
+        return JSONResponse(
+            {
+                "type": "error",
+                "error": {"type": "api_error", "message": resp.text[:1000]},
+            },
+            status_code=resp.status_code,
+        )
     try:
         return JSONResponse(_openai_response_to_anthropic(resp.json(), original_model))
     except Exception:
-        return JSONResponse({"type": "error", "error": {"type": "api_error", "message": "Invalid JSON from backend"}}, status_code=502)
+        return JSONResponse(
+            {
+                "type": "error",
+                "error": {"type": "api_error", "message": "Invalid JSON from backend"},
+            },
+            status_code=502,
+        )
 
 
 @app.post("/bedrock/model/{model_id:path}/invoke-with-response-stream")
@@ -471,7 +668,13 @@ async def bedrock_invoke_stream(model_id: str, request: Request):
     try:
         body = json.loads(raw_body)
     except json.JSONDecodeError as e:
-        return JSONResponse({"type": "error", "error": {"type": "invalid_request_error", "message": str(e)}}, status_code=400)
+        return JSONResponse(
+            {
+                "type": "error",
+                "error": {"type": "invalid_request_error", "message": str(e)},
+            },
+            status_code=400,
+        )
 
     original_model = body.pop("model", model_id)
     body.pop("anthropic_version", None)
@@ -482,13 +685,37 @@ async def bedrock_invoke_stream(model_id: str, request: Request):
     target_path = f"{INFERENCE_PREFIX}/chat/completions"
     headers = _backend_headers("POST", target_path, openai_json)
 
-    resp = get_client().post(f"{BASE_URL}{target_path}", headers=headers, content=openai_json, stream=True)
+    req = get_client().build_request(
+        "POST",
+        f"{BASE_URL}{target_path}",
+        headers=headers,
+        content=openai_json,
+    )
+    resp = get_client().send(req, stream=True)
     print(f"[bedrock] stream POST {target_path} -> {resp.status_code}")
     if resp.status_code >= 400:
-        return JSONResponse({"type": "error", "error": {"type": "api_error", "message": resp.text[:1000]}}, status_code=resp.status_code)
+        error_text = resp.text[:1000]
+        resp.close()
+        return JSONResponse(
+            {
+                "type": "error",
+                "error": {"type": "api_error", "message": error_text},
+            },
+            status_code=resp.status_code,
+        )
 
-    return StreamingResponse(_stream_openai_to_anthropic(resp, original_model, _estimate_tokens(openai_json)),
-                             media_type="text/event-stream")
+    return StreamingResponse(
+        _stream_openai_to_anthropic(resp, original_model, _estimate_tokens(openai_json)),
+        media_type="text/event-stream",
+    )
+
+
+# ---------------------------------------------------------------------------
+# WebSocket catch-all — reject upgrade so clients fall back to HTTP
+# ---------------------------------------------------------------------------
+@app.websocket("/{path:path}")
+async def websocket_reject(websocket: WebSocket, path: str):
+    await websocket.close(code=1001)
 
 
 # ---------------------------------------------------------------------------
@@ -500,7 +727,7 @@ async def proxy(path: str, request: Request):
 
     # Rewrite /v1/* -> /inference/v1/*
     if target_path.startswith("/v1/"):
-        target_path = INFERENCE_PREFIX + target_path[len("/v1"):]
+        target_path = INFERENCE_PREFIX + target_path[len("/v1") :]
     elif target_path == "/chat/completions":
         target_path = f"{INFERENCE_PREFIX}/chat/completions"
 
@@ -520,30 +747,79 @@ async def proxy(path: str, request: Request):
                     print(f"[proxy] Model rewrite: {original_model} -> {payload['model']}")
                 if "temperature" in payload and "top_p" in payload:
                     del payload["top_p"]
+                print(
+                    f"[proxy] payload model={original_model!r}, stream={payload.get('stream', False)}, "
+                    f"tools={len(payload.get('tools', [])) if isinstance(payload.get('tools'), list) else 0}, "
+                    f"tool_choice={payload.get('tool_choice')!r}"
+                )
                 body = json.dumps(payload)
         except (json.JSONDecodeError, KeyError):
             pass
 
     is_stream = False
     if body:
-        try:
+        with contextlib.suppress(json.JSONDecodeError, KeyError):
             is_stream = json.loads(body).get("stream", False)
-        except (json.JSONDecodeError, KeyError):
-            pass
 
     headers = _backend_headers(request.method, signed_path, body)
     if request.headers.get("content-type"):
         headers["Content-Type"] = request.headers["content-type"]
-
-    resp = get_client().request(method=request.method, url=target_url, headers=headers, content=body, stream=is_stream)
-    print(f"[proxy] {request.method} {signed_path} -> {resp.status_code}")
+    if target_path.endswith("/chat/completions"):
+        print(
+            f"[proxy] request accept={request.headers.get('accept')!r}, "
+            f"content_type={request.headers.get('content-type')!r}, "
+            f"content_length={request.headers.get('content-length')!r}, "
+            f"transfer_encoding={request.headers.get('transfer-encoding')!r}"
+        )
+    if target_path.endswith("/chat/completions") and not body_bytes:
+        if request.method == "POST":
+            accept = request.headers.get("accept", "")
+            if "text/event-stream" in accept:
+                print("[proxy] Empty SSE probe detected")
+                return StreamingResponse(iter([b"event: done\ndata: [DONE]\n\n"]), media_type="text/event-stream")
+        print("[proxy] Empty chat request body received")
+        return JSONResponse(
+            {
+                "error": {
+                    "message": "Empty request body received from client",
+                    "type": "invalid_request_error",
+                }
+            },
+            status_code=400,
+        )
 
     if is_stream:
-        return StreamingResponse(resp.iter_bytes(), status_code=resp.status_code,
-                                 media_type=resp.headers.get("content-type", "text/event-stream"))
+        req = get_client().build_request(
+            method=request.method,
+            url=target_url,
+            headers=headers,
+            content=body,
+        )
+        resp = get_client().send(req, stream=True)
+        print(f"[proxy] {request.method} {signed_path} -> {resp.status_code}")
+        if resp.status_code >= 400:
+            print(f"[proxy] Stream error content-type={resp.headers.get('content-type')!r}")
+        return StreamingResponse(
+            resp.iter_bytes(),
+            status_code=resp.status_code,
+            media_type=resp.headers.get("content-type", "text/event-stream"),
+        )
 
-    return StreamingResponse(iter([resp.content]), status_code=resp.status_code,
-                             media_type=resp.headers.get("content-type", "application/json"))
+    resp = get_client().request(
+        method=request.method,
+        url=target_url,
+        headers=headers,
+        content=body,
+    )
+    print(f"[proxy] {request.method} {signed_path} -> {resp.status_code}")
+    if resp.status_code >= 400:
+        print(f"[proxy] Error body: {resp.text[:1000]}")
+
+    return StreamingResponse(
+        iter([resp.content]),
+        status_code=resp.status_code,
+        media_type=resp.headers.get("content-type", "application/json"),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -555,8 +831,15 @@ def _discover_instance_and_team() -> None:
         return
     try:
         path = "/admin/v1/profile"
-        r = httpx.get(f"{BASE_URL}{path}", headers={"Authorization": f"Apikey {API_KEY}",
-                      "User-Agent": "bobshell/1.0.4", **sign_request("GET", path, "")}, timeout=10)
+        r = httpx.get(
+            f"{BASE_URL}{path}",
+            headers={
+                "Authorization": f"Apikey {API_KEY}",
+                "User-Agent": "bobshell/1.0.4",
+                **sign_request("GET", path, ""),
+            },
+            timeout=10,
+        )
         if r.status_code != 200:
             print(f"[startup] /admin/v1/profile -> {r.status_code}: {r.text[:200]}")
             return
@@ -591,22 +874,24 @@ def _print_banner():
     print(f"  Proxy:    http://localhost:{PORT}\n")
     print("OpenCode / OpenAI-compatible:")
     print(f"  baseURL: http://localhost:{PORT}/v1")
-    print(f"  apiKey:  any-value\n")
+    print("  apiKey:  any-value\n")
     print("JetBrains AI Assistant:")
     print(f"  URL: http://localhost:{PORT}/v1  |  Model: sonnet-4.5\n")
     print("Claude Code (Anthropic mode):")
     print(f"  ANTHROPIC_BASE_URL=http://localhost:{PORT}/anthropic ANTHROPIC_API_KEY=proxy claude\n")
     print("Claude Code (Bedrock mode — Windows, set once):")
-    print(f'  [System.Environment]::SetEnvironmentVariable("CLAUDE_CODE_USE_BEDROCK","1","User")')
-    print(f'  [System.Environment]::SetEnvironmentVariable("ANTHROPIC_BEDROCK_BASE_URL","http://localhost:{PORT}/bedrock","User")')
-    print(f'  [System.Environment]::SetEnvironmentVariable("CLAUDE_CODE_SKIP_BEDROCK_AUTH","1","User")')
-    print(f'  [System.Environment]::SetEnvironmentVariable("CLAUDE_CODE_DISABLE_BEDROCK_CONTENT_TYPE_GUARD","1","User")')
-    print(f'  [System.Environment]::SetEnvironmentVariable("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC","1","User")')
-    print(f'  [System.Environment]::SetEnvironmentVariable("AWS_ACCESS_KEY_ID","dummy","User")')
-    print(f'  [System.Environment]::SetEnvironmentVariable("AWS_SECRET_ACCESS_KEY","dummy","User")')
-    print(f'  [System.Environment]::SetEnvironmentVariable("AWS_REGION","us-east-1","User")')
-    print(f'  [System.Environment]::SetEnvironmentVariable("ANTHROPIC_DEFAULT_MODEL","premium","User")\n')
+    print('  [System.Environment]::SetEnvironmentVariable("CLAUDE_CODE_USE_BEDROCK","1","User")')
+    print(
+        f'  [System.Environment]::SetEnvironmentVariable("ANTHROPIC_BEDROCK_BASE_URL","http://localhost:{PORT}/bedrock","User")'
+    )
+    print('  [System.Environment]::SetEnvironmentVariable("CLAUDE_CODE_SKIP_BEDROCK_AUTH","1","User")')
+    print('  [System.Environment]::SetEnvironmentVariable("CLAUDE_CODE_DISABLE_BEDROCK_CONTENT_TYPE_GUARD","1","User")')
+    print('  [System.Environment]::SetEnvironmentVariable("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC","1","User")')
+    print('  [System.Environment]::SetEnvironmentVariable("AWS_ACCESS_KEY_ID","dummy","User")')
+    print('  [System.Environment]::SetEnvironmentVariable("AWS_SECRET_ACCESS_KEY","dummy","User")')
+    print('  [System.Environment]::SetEnvironmentVariable("AWS_REGION","us-east-1","User")')
+    print('  [System.Environment]::SetEnvironmentVariable("ANTHROPIC_DEFAULT_MODEL","premium","User")\n')
 
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=PORT)
+    uvicorn.run("proxy:app", host="0.0.0.0", port=PORT, reload=True, http="h11")

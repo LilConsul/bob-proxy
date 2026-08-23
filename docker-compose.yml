@@ -5,4 +5,7 @@ services:
       - "8989:8989"
     env_file:
       - .env
+    volumes:
+      - ./proxy.py:/app/proxy.py
+      - ./.env:/app/.env
     restart: unless-stopped

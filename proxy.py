@@ -760,11 +760,6 @@ async def proxy(path: str, request: Request):
     if request.headers.get("content-type"):
         headers["Content-Type"] = request.headers["content-type"]
     if target_path.endswith("/chat/completions") and not body_bytes:
-        if request.method == "POST":
-            accept = request.headers.get("accept", "")
-            if "text/event-stream" in accept:
-                logger.info("[proxy] Empty SSE probe detected")
-                return StreamingResponse(iter([b"event: done\ndata: [DONE]\n\n"]), media_type="text/event-stream")
         logger.warning("[proxy] Empty chat request body received")
         return JSONResponse(
             {

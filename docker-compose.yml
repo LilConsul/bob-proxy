@@ -2,7 +2,7 @@ services:
   proxy:
     build: .
     ports:
-      - "8989:8989"
+      - "127.0.0.1:8989:8989"
     env_file:
       - .env
     volumes:

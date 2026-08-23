@@ -883,4 +883,4 @@ def _print_banner():
 
 
 if __name__ == "__main__":
-    uvicorn.run("proxy:app", host="0.0.0.0", port=PORT, reload=True, http="h11")
+    uvicorn.run("proxy:app", host="0.0.0.0", port=PORT, reload=True, http="h11", log_level="error")

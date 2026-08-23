@@ -6,7 +6,9 @@ readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
     "httpx",
-    "fastapi[standard]",
+    "fastapi",
+    "uvicorn",
+    "h11",
 ]
 
 [tool.ruff]

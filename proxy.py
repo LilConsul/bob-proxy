@@ -38,14 +38,13 @@ Listens on http://localhost:8989 and forwards to Bob's backend with
 HMAC signing + API key auth injected into every request.
 """
 
-import contextlib
 import hashlib
 import hmac
 import json
 import logging
 import os
 import uuid
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -57,11 +56,11 @@ from fastapi.responses import JSONResponse, StreamingResponse
 # Load .env file if present
 _env_path = Path(__file__).resolve().parent / ".env"
 if _env_path.exists():
-    for line in _env_path.read_text().splitlines():
-        line = line.strip()
-        if line and not line.startswith("#") and "=" in line:
-            key, _, value = line.partition("=")
-            os.environ.setdefault(key.strip(), value.strip())
+    for _line in _env_path.read_text().splitlines():
+        _line = _line.strip()
+        if _line and not _line.startswith("#") and "=" in _line:
+            _k, _, _v = _line.partition("=")
+            os.environ.setdefault(_k.strip(), _v.strip())
 
 BASE_URL = "https://api.us-east.bob.ibm.com"
 HMAC_SECRET = "c102b927-013e-42e4-bc65-16625f35807a"
@@ -89,7 +88,7 @@ app = FastAPI(lifespan=lifespan)
 
 # Map any model name to the backend alias.
 # Well-known OpenAI aliases included so clients like JetBrains AI Assistant
-# (which only accept recognised model IDs) can connect.
+# (which only accept recognized model IDs) can connect.
 MODEL_MAP = {
     "premium": "premium",
     "premium-fallback": "premium-fallback",
@@ -261,14 +260,14 @@ def _anthropic_request_to_openai(body: dict) -> dict:
     tc = _translate_tool_choice(body.get("tool_choice"))
     if tc is not None:
         out["tool_choice"] = tc
-    for key, okey in [
+    for src_key, dst_key in [
         ("max_tokens", "max_tokens"),
         ("temperature", "temperature"),
         ("top_p", "top_p"),
         ("stop_sequences", "stop"),
     ]:
-        if key in body:
-            out[okey] = body[key]
+        if src_key in body:
+            out[dst_key] = body[src_key]
     if "temperature" in out and "top_p" in out:
         del out["top_p"]
     if body.get("stream", False):
@@ -292,7 +291,7 @@ def _openai_response_to_anthropic(resp_json: dict, model: str) -> dict:
         content_blocks.append(
             {
                 "type": "tool_use",
-                "id": tc.get("id", f"toolu_{uuid.uuid4().hex[:24]}"),
+                "id": tc.get("id", f"tool_{uuid.uuid4().hex[:24]}"),
                 "name": fn.get("name", ""),
                 "input": args,
             }
@@ -415,7 +414,7 @@ def _stream_openai_to_anthropic(resp: httpx.Response, model: str, input_tokens: 
                 tc_index = tc_delta.get("index", 0)
                 if tc_index not in tool_calls_in_progress:
                     fn = tc_delta.get("function", {})
-                    tc_id = tc_delta.get("id", f"toolu_{uuid.uuid4().hex[:24]}")
+                    tc_id = tc_delta.get("id", f"tool_{uuid.uuid4().hex[:24]}")
                     tc_name = fn.get("name", "")
                     tool_calls_in_progress[tc_index] = {
                         "id": tc_id,
@@ -474,13 +473,10 @@ def _stream_openai_to_anthropic(resp: httpx.Response, model: str, input_tokens: 
 # ---------------------------------------------------------------------------
 # Shared HTTP client (connection pooling, keep-alive)
 # ---------------------------------------------------------------------------
-_client: httpx.Client | None = None
+_client = httpx.Client(timeout=300)
 
 
 def get_client() -> httpx.Client:
-    global _client
-    if _client is None:
-        _client = httpx.Client(timeout=300)
     return _client
 
 
@@ -496,6 +492,13 @@ def _backend_headers(method: str, path: str, body: str) -> dict[str, str]:
         headers["x-team-id"] = TEAM_ID
     headers.update(sign_request(method, path, body))
     return headers
+
+
+def _backend_parse_error() -> JSONResponse:
+    return JSONResponse(
+        {"type": "error", "error": {"type": "api_error", "message": "Invalid JSON from backend"}},
+        status_code=502,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -586,33 +589,34 @@ async def anthropic_messages(request: Request):
         )
     try:
         anthropic_resp = _openai_response_to_anthropic(resp.json(), original_model)
-    except Exception:
-        return JSONResponse(
-            {
-                "type": "error",
-                "error": {"type": "api_error", "message": "Invalid JSON from backend"},
-            },
-            status_code=502,
-        )
+    except (ValueError, KeyError):
+        return _backend_parse_error()
     return JSONResponse(anthropic_resp)
 
 
 # ---------------------------------------------------------------------------
 # Bedrock routes
 # ---------------------------------------------------------------------------
-@app.post("/bedrock/model/{model_id:path}/invoke")
-async def bedrock_invoke(model_id: str, request: Request):
-    raw_body = await request.body()
+def _parse_bedrock_body(raw_body: bytes):
+    """Parse JSON body for Bedrock routes; returns (dict, None) or (None, JSONResponse)."""
     try:
-        body = json.loads(raw_body)
+        return json.loads(raw_body), None
     except json.JSONDecodeError as e:
-        return JSONResponse(
+        return None, JSONResponse(
             {
                 "type": "error",
                 "error": {"type": "invalid_request_error", "message": str(e)},
             },
             status_code=400,
         )
+
+
+@app.post("/bedrock/model/{model_id:path}/invoke")
+async def bedrock_invoke(model_id: str, request: Request):
+    raw_body = await request.body()
+    body, err = _parse_bedrock_body(raw_body)
+    if err is not None:
+        return err
 
     original_model = body.pop("model", model_id)
     body.pop("anthropic_version", None)
@@ -652,29 +656,16 @@ async def bedrock_invoke(model_id: str, request: Request):
         )
     try:
         return JSONResponse(_openai_response_to_anthropic(resp.json(), original_model))
-    except Exception:
-        return JSONResponse(
-            {
-                "type": "error",
-                "error": {"type": "api_error", "message": "Invalid JSON from backend"},
-            },
-            status_code=502,
-        )
+    except (ValueError, KeyError):
+        return _backend_parse_error()
 
 
 @app.post("/bedrock/model/{model_id:path}/invoke-with-response-stream")
 async def bedrock_invoke_stream(model_id: str, request: Request):
     raw_body = await request.body()
-    try:
-        body = json.loads(raw_body)
-    except json.JSONDecodeError as e:
-        return JSONResponse(
-            {
-                "type": "error",
-                "error": {"type": "invalid_request_error", "message": str(e)},
-            },
-            status_code=400,
-        )
+    body, err = _parse_bedrock_body(raw_body)
+    if err is not None:
+        return err
 
     original_model = body.pop("model", model_id)
     body.pop("anthropic_version", None)
@@ -714,7 +705,7 @@ async def bedrock_invoke_stream(model_id: str, request: Request):
 # WebSocket catch-all — reject upgrade so clients fall back to HTTP
 # ---------------------------------------------------------------------------
 @app.websocket("/{path:path}")
-async def websocket_reject(websocket: WebSocket, path: str):
+async def websocket_reject(websocket: WebSocket):
     await websocket.close(code=1001)
 
 
@@ -753,7 +744,7 @@ async def proxy(path: str, request: Request):
 
     is_stream = False
     if body:
-        with contextlib.suppress(json.JSONDecodeError, KeyError):
+        with suppress(json.JSONDecodeError, KeyError):
             is_stream = json.loads(body).get("stream", False)
 
     headers = _backend_headers(request.method, signed_path, body)

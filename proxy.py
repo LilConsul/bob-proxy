@@ -91,7 +91,6 @@ app = FastAPI(lifespan=lifespan)
 # (which only accept recognized model IDs) can connect.
 MODEL_MAP = {
     "premium": "premium",
-    "premium-fallback": "premium-fallback",
     "premium-shell": "premium-shell",
     "premium-ide": "premium-ide",
     "mistral-medium-3.1": "mistral-medium-3.1",
@@ -611,6 +610,26 @@ def _parse_bedrock_body(raw_body: bytes):
         )
 
 
+@app.get("/bedrock/inference-profiles/{model_id:path}")
+async def bedrock_get_inference_profile(model_id: str):
+    """Mock inference profile endpoint — Claude Code probes this but doesn't need it."""
+    logger.info("[bedrock] get-inference-profile: model=%s (returning mock)", model_id)
+    return JSONResponse(
+        {
+            "inferenceProfileArn": f"arn:aws:bedrock:us-east-1::inference-profile/{model_id}",
+            "inferenceProfileId": model_id,
+            "inferenceProfileName": model_id,
+            "type": "SYSTEM_DEFINED",
+            "status": "ACTIVE",
+            "models": [
+                {
+                    "modelArn": f"arn:aws:bedrock:us-east-1::foundation-model/{model_id}",
+                }
+            ],
+        }
+    )
+
+
 @app.post("/bedrock/model/{model_id:path}/invoke")
 async def bedrock_invoke(model_id: str, request: Request):
     raw_body = await request.body()
@@ -715,6 +734,20 @@ async def websocket_reject(websocket: WebSocket):
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"])
 async def proxy(path: str, request: Request):
     target_path = f"/{path}" if path else "/"
+
+    # Block non-existent Bedrock endpoints that aren't handled above
+    if target_path.startswith("/bedrock/") and "/invoke" not in target_path:
+        logger.warning("[proxy] Unsupported Bedrock endpoint: %s", target_path)
+        return JSONResponse(
+            {
+                "type": "error",
+                "error": {
+                    "type": "not_found",
+                    "message": f"Endpoint {target_path} not supported by this proxy",
+                },
+            },
+            status_code=404,
+        )
 
     # Rewrite /v1/* -> /inference/v1/*
     if target_path.startswith("/v1/"):

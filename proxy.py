@@ -91,19 +91,19 @@ app = FastAPI(lifespan=lifespan)
 # (which only accept recognized model IDs) can connect.
 MODEL_MAP = {
     "premium": "premium",
+    "premium-fallback": "premium-fallback",
     "premium-shell": "premium-shell",
     "premium-ide": "premium-ide",
+    "sonnet-4.5": "sonnet-4.5",
+    "sonnet-4.5-global-ibm-only": "sonnet-4.5-global-ibm-only",
+    "sonnet-4.6": "sonnet-4.6",
+    "haiku-4.5": "haiku-4.5",
+    "explorer": "explorer",
     "mistral-medium-3.1": "mistral-medium-3.1",
     "granite-8b-code-instruct": "granite-8b-code-instruct",
-    "openai/gpt-oss-20b": "openai/gpt-oss-20b",
     "codestral-2508": "codestral-2508",
-    "rnj-1-test": "rnj-1-test",
-    "sonnet-4.5-global-ibm-only": "sonnet-4.5-global-ibm-only",
-    "sonnet-4.5": "sonnet-4.5",
-    "explorer": "explorer",
-    "haiku-4.5": "haiku-4.5",
+    "openai/gpt-oss-20b": "openai/gpt-oss-20b",
     "gpt-2026-5.4": "gpt-2026-5.4",
-    "sonnet-4.6": "sonnet-4.6",
     # OpenAI aliases — map to premium
     "gpt-4o": "premium",
     "gpt-4o-mini": "premium",
@@ -898,7 +898,11 @@ def _print_banner():
     logger.info('  [System.Environment]::SetEnvironmentVariable("AWS_ACCESS_KEY_ID","dummy","User")')
     logger.info('  [System.Environment]::SetEnvironmentVariable("AWS_SECRET_ACCESS_KEY","dummy","User")')
     logger.info('  [System.Environment]::SetEnvironmentVariable("AWS_REGION","us-east-1","User")')
-    logger.info('  [System.Environment]::SetEnvironmentVariable("ANTHROPIC_DEFAULT_MODEL","premium","User")\n')
+    logger.info('  [System.Environment]::SetEnvironmentVariable("ANTHROPIC_DEFAULT_MODEL","premium","User")')
+    logger.info('  [System.Environment]::SetEnvironmentVariable("CLAUDE_CODE_AUTO_MODE_SERVER","0","User")\n')
+    logger.info("  NOTE: CLAUDE_CODE_AUTO_MODE_SERVER=0 suppresses the 'session not eligible for auto mode'")
+    logger.info("  notice. This proxy translates Anthropic<->OpenAI format, so server-side classifier")
+    logger.info("  checks are never available. Set this once and the notice won't appear again.\n")
 
 
 if __name__ == "__main__":

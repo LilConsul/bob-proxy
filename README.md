@@ -52,7 +52,7 @@ Then under **Model Assignment**, pick any model from the list (e.g. `sonnet-4.5`
 ### Claude Code (Anthropic mode)
 
 ```bash
-ANTHROPIC_BASE_URL=http://localhost:8989/anthropic ANTHROPIC_API_KEY=proxy claude --model premium
+ANTHROPIC_BASE_URL=http://localhost:8989/anthropic ANTHROPIC_API_KEY=proxy CLAUDE_CODE_AUTO_MODE_SERVER=0 claude --model premium
 ```
 
 ### Claude Code (Bedrock mode)
@@ -68,6 +68,7 @@ ANTHROPIC_BASE_URL=http://localhost:8989/anthropic ANTHROPIC_API_KEY=proxy claud
 [System.Environment]::SetEnvironmentVariable("AWS_SECRET_ACCESS_KEY","dummy","User")
 [System.Environment]::SetEnvironmentVariable("AWS_REGION","us-east-1","User")
 [System.Environment]::SetEnvironmentVariable("ANTHROPIC_DEFAULT_MODEL","premium","User")
+[System.Environment]::SetEnvironmentVariable("CLAUDE_CODE_AUTO_MODE_SERVER","0","User")
 ```
 
 **Linux/macOS** — inline per session:
@@ -81,8 +82,11 @@ AWS_ACCESS_KEY_ID=dummy \
 AWS_SECRET_ACCESS_KEY=dummy \
 AWS_REGION=us-east-1 \
 ANTHROPIC_DEFAULT_MODEL=premium \
+CLAUDE_CODE_AUTO_MODE_SERVER=0 \
 claude
 ```
+
+> **`CLAUDE_CODE_AUTO_MODE_SERVER=0`** — suppresses the _"this session isn't eligible for auto mode's no-charge classifier requests"_ notice. This proxy translates between Anthropic and OpenAI formats, so server-side classifier checks are never available here. Set this once and it won't appear again.
 
 ### GitHub Copilot (VS Code)
 
@@ -127,10 +131,12 @@ MODEL_NAME=premium
 | `premium-shell` | Optimised for shell/terminal use |
 | `premium-ide` | Optimised for IDE use |
 | `sonnet-4.5` | Claude Sonnet 4.5 |
+| `sonnet-4.5-global-ibm-only` | Claude Sonnet 4.5 (IBM-only global) |
 | `sonnet-4.6` | Claude Sonnet 4.6 |
 | `haiku-4.5` | Claude Haiku 4.5 |
 | `explorer` | Explorer model |
 | `mistral-medium-3.1` | Mistral Medium 3.1 |
 | `granite-8b-code-instruct` | Granite 8B Code |
-| `codestral-2508` | Codestral |
+| `codestral-2508` | Codestral 2508 |
 | `openai/gpt-oss-20b` | GPT OSS 20B |
+| `gpt-2026-5.4` | GPT 2026 5.4 |

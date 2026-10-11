@@ -52,6 +52,7 @@ import httpx
 import uvicorn
 from fastapi import FastAPI, Request, WebSocket
 from fastapi.responses import JSONResponse, StreamingResponse
+from typing import AsyncIterator
 
 # Load .env file if present
 _env_path = Path(__file__).resolve().parent / ".env"
@@ -80,8 +81,13 @@ logger = logging.getLogger("bob-proxy")
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    global _client
+    _client = httpx.AsyncClient(timeout=300)
     _print_banner()
-    yield
+    try:
+        yield
+    finally:
+        await _client.aclose()
 
 
 app = FastAPI(lifespan=lifespan)
@@ -320,7 +326,7 @@ def _openai_response_to_anthropic(resp_json: dict, model: str) -> dict:
     }
 
 
-def _stream_openai_to_anthropic(resp: httpx.Response, model: str, input_tokens: int):
+async def _stream_openai_to_anthropic(resp: httpx.Response, model: str, input_tokens: int) -> AsyncIterator[bytes]:
     msg_id = f"msg_{uuid.uuid4().hex[:24]}"
     yield _sse(
         "message_start",
@@ -351,7 +357,7 @@ def _stream_openai_to_anthropic(resp: httpx.Response, model: str, input_tokens: 
     output_tokens = 0
     stop_reason = "end_turn"
 
-    for raw_line in resp.iter_lines():
+    async for raw_line in resp.aiter_lines():
         if not raw_line or not raw_line.startswith("data: "):
             continue
         data_str = raw_line[6:].strip()
@@ -472,10 +478,11 @@ def _stream_openai_to_anthropic(resp: httpx.Response, model: str, input_tokens: 
 # ---------------------------------------------------------------------------
 # Shared HTTP client (connection pooling, keep-alive)
 # ---------------------------------------------------------------------------
-_client = httpx.Client(timeout=300)
+_client: httpx.AsyncClient | None = None
 
 
-def get_client() -> httpx.Client:
+def get_client() -> httpx.AsyncClient:
+    assert _client is not None, "HTTP client not initialised"
     return _client
 
 
@@ -551,18 +558,18 @@ async def anthropic_messages(request: Request):
     headers = _backend_headers("POST", target_path, openai_json)
 
     if is_stream:
-        resp = get_client().build_request(
+        req = get_client().build_request(
             "POST",
             f"{BASE_URL}{target_path}",
             headers=headers,
             content=openai_json,
         )
-        backend_resp = get_client().send(resp, stream=True)
+        backend_resp = await get_client().send(req, stream=True)
         logger.info("[anthropic->openai] POST %s -> %s", target_path, backend_resp.status_code)
         if backend_resp.status_code >= 400:
-            error_text = backend_resp.text[:1000]
+            error_text = (await backend_resp.aread()).decode()[:1000]
             logger.error("[anthropic->openai] Error: %s", error_text)
-            backend_resp.close()
+            await backend_resp.aclose()
             return JSONResponse(
                 {"type": "error", "error": {"type": "api_error", "message": error_text}},
                 status_code=backend_resp.status_code,
@@ -572,7 +579,7 @@ async def anthropic_messages(request: Request):
             media_type="text/event-stream",
         )
 
-    resp = get_client().post(
+    resp = await get_client().post(
         f"{BASE_URL}{target_path}",
         headers=headers,
         content=openai_json,
@@ -646,7 +653,7 @@ async def bedrock_invoke(model_id: str, request: Request):
     headers = _backend_headers("POST", target_path, openai_json)
 
     try:
-        resp = get_client().post(
+        resp = await get_client().post(
             f"{BASE_URL}{target_path}",
             headers=headers,
             content=openai_json,
@@ -701,11 +708,12 @@ async def bedrock_invoke_stream(model_id: str, request: Request):
         headers=headers,
         content=openai_json,
     )
-    resp = get_client().send(req, stream=True)
+    resp = await get_client().send(req, stream=True)
     logger.info("[bedrock] stream POST %s -> %s", target_path, resp.status_code)
     if resp.status_code >= 400:
+        await resp.aread()
         error_text = resp.text[:1000]
-        resp.close()
+        await resp.aclose()
         return JSONResponse(
             {
                 "type": "error",
@@ -802,15 +810,15 @@ async def proxy(path: str, request: Request):
             headers=headers,
             content=body,
         )
-        resp = get_client().send(req, stream=True)
+        resp = await get_client().send(req, stream=True)
         logger.info("[proxy] %s %s -> %s", request.method, signed_path, resp.status_code)
         return StreamingResponse(
-            resp.iter_bytes(),
+            resp.aiter_bytes(),
             status_code=resp.status_code,
             media_type=resp.headers.get("content-type", "text/event-stream"),
         )
 
-    resp = get_client().request(
+    resp = await get_client().request(
         method=request.method,
         url=target_url,
         headers=headers,

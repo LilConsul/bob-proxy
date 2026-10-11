@@ -44,15 +44,15 @@ import json
 import logging
 import os
 import uuid
-from contextlib import asynccontextmanager, suppress
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import AsyncIterator
 
 import httpx
 import uvicorn
 from fastapi import FastAPI, Request, WebSocket
-from fastapi.responses import JSONResponse, StreamingResponse
-from typing import AsyncIterator
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 # Load .env file if present
 _env_path = Path(__file__).resolve().parent / ".env"
@@ -83,6 +83,7 @@ logger = logging.getLogger("bob-proxy")
 async def lifespan(_: FastAPI):
     global _client
     _client = httpx.AsyncClient(timeout=300)
+    await _discover_instance_and_team()
     _print_banner()
     try:
         yield
@@ -507,6 +508,43 @@ def _backend_parse_error() -> JSONResponse:
     )
 
 
+def _error_response(message: str, status_code: int, kind: str = "api_error") -> JSONResponse:
+    """Uniform error shape used across all routes."""
+    return JSONResponse(
+        {"type": "error", "error": {"type": kind, "message": message}},
+        status_code=status_code,
+    )
+
+
+async def _post_json(path: str, body_str: str, *, timeout: float | None = None) -> httpx.Response:
+    """POST *body_str* to *path* on the backend and return the response (non-streaming)."""
+    kw = {"timeout": timeout} if timeout is not None else {}
+    return await get_client().post(
+        f"{BASE_URL}{path}",
+        headers=_backend_headers("POST", path, body_str),
+        content=body_str,
+        **kw,
+    )
+
+
+async def _open_stream(path: str, body_str: str) -> httpx.Response:
+    """Open a streaming POST to *path* and return the raw response (caller must close)."""
+    req = get_client().build_request(
+        "POST",
+        f"{BASE_URL}{path}",
+        headers=_backend_headers("POST", path, body_str),
+        content=body_str,
+    )
+    return await get_client().send(req, stream=True)
+
+
+async def _stream_error_response(resp: httpx.Response) -> JSONResponse:
+    """Read and close an error stream response, return a JSONResponse."""
+    error_text = (await resp.aread()).decode()[:1000]
+    await resp.aclose()
+    return _error_response(error_text, resp.status_code)
+
+
 # ---------------------------------------------------------------------------
 # /v1/models — JetBrains and other OpenAI-compatible clients probe this first
 # ---------------------------------------------------------------------------
@@ -555,49 +593,27 @@ async def anthropic_messages(request: Request):
     )
 
     target_path = f"{INFERENCE_PREFIX}/chat/completions"
-    headers = _backend_headers("POST", target_path, openai_json)
 
     if is_stream:
-        req = get_client().build_request(
-            "POST",
-            f"{BASE_URL}{target_path}",
-            headers=headers,
-            content=openai_json,
-        )
-        backend_resp = await get_client().send(req, stream=True)
+        backend_resp = await _open_stream(target_path, openai_json)
         logger.info("[anthropic->openai] POST %s -> %s", target_path, backend_resp.status_code)
         if backend_resp.status_code >= 400:
-            error_text = (await backend_resp.aread()).decode()[:1000]
-            logger.error("[anthropic->openai] Error: %s", error_text)
-            await backend_resp.aclose()
-            return JSONResponse(
-                {"type": "error", "error": {"type": "api_error", "message": error_text}},
-                status_code=backend_resp.status_code,
-            )
+            logger.error("[anthropic->openai] Error: %s", backend_resp.status_code)
+            return await _stream_error_response(backend_resp)
         return StreamingResponse(
             _stream_openai_to_anthropic(backend_resp, original_model, _estimate_tokens(openai_json)),
             media_type="text/event-stream",
         )
 
-    resp = await get_client().post(
-        f"{BASE_URL}{target_path}",
-        headers=headers,
-        content=openai_json,
-    )
+    resp = await _post_json(target_path, openai_json)
     logger.info("[anthropic->openai] POST %s -> %s", target_path, resp.status_code)
-
     if resp.status_code >= 400:
-        error_text = resp.text[:1000]
-        logger.error("[anthropic->openai] Error: %s", error_text)
-        return JSONResponse(
-            {"type": "error", "error": {"type": "api_error", "message": error_text}},
-            status_code=resp.status_code,
-        )
+        logger.error("[anthropic->openai] Error: %s", resp.text[:1000])
+        return _error_response(resp.text[:1000], resp.status_code)
     try:
-        anthropic_resp = _openai_response_to_anthropic(resp.json(), original_model)
+        return JSONResponse(_openai_response_to_anthropic(resp.json(), original_model))
     except (ValueError, KeyError):
         return _backend_parse_error()
-    return JSONResponse(anthropic_resp)
 
 
 # ---------------------------------------------------------------------------
@@ -650,36 +666,15 @@ async def bedrock_invoke(model_id: str, request: Request):
 
     logger.info("[bedrock] invoke: model=%s, messages=%s", original_model, len(body.get("messages", [])))
     target_path = f"{INFERENCE_PREFIX}/chat/completions"
-    headers = _backend_headers("POST", target_path, openai_json)
 
     try:
-        resp = await get_client().post(
-            f"{BASE_URL}{target_path}",
-            headers=headers,
-            content=openai_json,
-            timeout=120,
-        )
+        resp = await _post_json(target_path, openai_json, timeout=120)
     except httpx.TimeoutException:
-        return JSONResponse(
-            {
-                "type": "error",
-                "error": {
-                    "type": "timeout_error",
-                    "message": "Request timed out after 120s",
-                },
-            },
-            status_code=504,
-        )
+        return _error_response("Request timed out after 120s", 504, "timeout_error")
 
     logger.info("[bedrock] POST %s -> %s", target_path, resp.status_code)
     if resp.status_code >= 400:
-        return JSONResponse(
-            {
-                "type": "error",
-                "error": {"type": "api_error", "message": resp.text[:1000]},
-            },
-            status_code=resp.status_code,
-        )
+        return _error_response(resp.text[:1000], resp.status_code)
     try:
         return JSONResponse(_openai_response_to_anthropic(resp.json(), original_model))
     except (ValueError, KeyError):
@@ -700,27 +695,11 @@ async def bedrock_invoke_stream(model_id: str, request: Request):
 
     logger.info("[bedrock] invoke-stream: model=%s, messages=%s", original_model, len(body.get("messages", [])))
     target_path = f"{INFERENCE_PREFIX}/chat/completions"
-    headers = _backend_headers("POST", target_path, openai_json)
 
-    req = get_client().build_request(
-        "POST",
-        f"{BASE_URL}{target_path}",
-        headers=headers,
-        content=openai_json,
-    )
-    resp = await get_client().send(req, stream=True)
+    resp = await _open_stream(target_path, openai_json)
     logger.info("[bedrock] stream POST %s -> %s", target_path, resp.status_code)
     if resp.status_code >= 400:
-        await resp.aread()
-        error_text = resp.text[:1000]
-        await resp.aclose()
-        return JSONResponse(
-            {
-                "type": "error",
-                "error": {"type": "api_error", "message": error_text},
-            },
-            status_code=resp.status_code,
-        )
+        return await _stream_error_response(resp)
 
     return StreamingResponse(
         _stream_openai_to_anthropic(resp, original_model, _estimate_tokens(openai_json)),
@@ -769,6 +748,7 @@ async def proxy(path: str, request: Request):
     body_bytes = await request.body()
     body = body_bytes.decode()
 
+    payload: dict | None = None
     if body:
         try:
             payload = json.loads(body)
@@ -783,10 +763,7 @@ async def proxy(path: str, request: Request):
         except (json.JSONDecodeError, KeyError):
             pass
 
-    is_stream = False
-    if body:
-        with suppress(json.JSONDecodeError, KeyError):
-            is_stream = json.loads(body).get("stream", False)
+    is_stream = bool(payload and payload.get("stream"))
 
     headers = _backend_headers(request.method, signed_path, body)
     if request.headers.get("content-type"):
@@ -828,8 +805,8 @@ async def proxy(path: str, request: Request):
     if resp.status_code >= 400:
         logger.error("[proxy] Error body: %s", resp.text[:1000])
 
-    return StreamingResponse(
-        iter([resp.content]),
+    return Response(
+        content=resp.content,
         status_code=resp.status_code,
         media_type=resp.headers.get("content-type", "application/json"),
     )
@@ -838,13 +815,13 @@ async def proxy(path: str, request: Request):
 # ---------------------------------------------------------------------------
 # Startup: discover instance/team IDs
 # ---------------------------------------------------------------------------
-def _discover_instance_and_team() -> None:
+async def _discover_instance_and_team() -> None:
     global INSTANCE_ID, TEAM_ID
     if INSTANCE_ID and TEAM_ID:
         return
     try:
         path = "/admin/v1/profile"
-        r = httpx.get(
+        r = await get_client().get(
             f"{BASE_URL}{path}",
             headers={
                 "Authorization": f"Apikey {API_KEY}",
@@ -874,8 +851,6 @@ def _discover_instance_and_team() -> None:
 if not API_KEY:
     logger.error("No API key configured. Set BOB_API_KEY in .env or environment.")
     raise SystemExit(1)
-
-_discover_instance_and_team()
 
 
 def _print_banner():
@@ -914,4 +889,4 @@ def _print_banner():
 
 
 if __name__ == "__main__":
-    uvicorn.run("proxy:app", host="0.0.0.0", port=PORT, reload=True, http="h11", log_level="error")
+    uvicorn.run("proxy:app", host="0.0.0.0", port=PORT, reload=True, http="httptools", log_level="error")
